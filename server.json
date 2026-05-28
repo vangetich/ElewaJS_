@@ -1,0 +1,202 @@
+require('dotenv').config();
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const { nanoid } = require('nanoid');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+app.use(cors());
+app.use(express.json());
+
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const LANG_FILE = path.join(DATA_DIR, 'languages.json');
+const PROVERB_FILE = path.join(DATA_DIR, 'proverbs.json');
+const BOOKS_FILE = path.join(DATA_DIR, 'books.json');
+const FAQ_FILE = path.join(DATA_DIR, 'faq.json');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+const SALT_ROUNDS = 10;
+
+function readJSON(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { return null; }
+}
+function writeJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+if (!fs.existsSync(USERS_FILE)) writeJSON(USERS_FILE, []);
+
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); } catch (e) { return null; }
+}
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ message: 'Missing token' });
+  const token = auth.split(' ')[1];
+  const decoded = verifyToken(token);
+  if (!decoded) return res.status(401).json({ message: 'Invalid token' });
+  const users = readJSON(USERS_FILE) || [];
+  const user = users.find(u => u.id === decoded.id);
+  if (!user) return res.status(401).json({ message: 'User not found' });
+  req.user = user;
+  next();
+}
+function isMinor(ageGroup) {
+  return ageGroup && (ageGroup === '5-12' || ageGroup === '13-17');
+}
+
+// Public endpoints
+app.get('/api/languages', (req, res) => {
+  const langs = readJSON(LANG_FILE) || [];
+  res.json({ languages: langs });
+});
+
+app.get('/api/proverb', (req, res) => {
+  const lang = (req.query.lang || 'english').toLowerCase();
+  const proverbs = readJSON(PROVERB_FILE) || {};
+  const list = proverbs[lang] || proverbs['english'] || [];
+  const proverb = list[Math.floor(Math.random() * list.length)] || { text: 'Wisdom is shared.' };
+  res.json({ proverb });
+});
+
+app.get('/api/books', (req, res) => {
+  const ageGroup = req.query.ageGroup || '5-12';
+  const lang = (req.query.lang || 'english').toLowerCase();
+  const books = readJSON(BOOKS_FILE) || {};
+  const list = (books[ageGroup] || []).map(b => {
+    const variant = (b.variants || []).find(v => v.lang === lang) || null;
+    return { ...b, variant };
+  });
+  res.json({ books: list });
+});
+
+app.get('/api/faq', (req, res) => {
+  const lang = (req.query.lang || 'english').toLowerCase();
+  const faq = readJSON(FAQ_FILE) || {};
+  res.json({ faq: faq[lang] || faq['english'] || [] });
+});
+
+app.get('/api/activities', (req, res) => {
+  const activities = [
+    { id: 'reading-1', type: 'reading_test', title: 'Beginner Reading Test', ageGroup: '5-12', level: 'local' },
+    { id: 'writing-1', type: 'writing_competition', title: 'Short Story Contest', ageGroup: '13-17', level: 'regional' },
+    { id: 'puzzle-1', type: 'word_puzzle', title: 'Word Puzzle Pack', ageGroup: '5-12', level: 'local' },
+    { id: 'spelling-weekly', type: 'spelling_contest', title: 'Weekly Spelling Bee', ageGroup: '5-12', level: 'national' }
+  ];
+  res.json({ activities });
+});
+
+// Signup with password and parental consent handling
+app.post('/api/signup', async (req, res) => {
+  const { name, ageGroup, language, motherTongue, learning, email, password, parentEmail } = req.body;
+  if (!name || !ageGroup || !language || !password) {
+    return res.status(400).json({ message: 'Name, age group, language and password are required.' });
+  }
+  const users = readJSON(USERS_FILE) || [];
+  if (email && users.find(u => u.email === email)) {
+    return res.status(400).json({ message: 'Email already registered.' });
+  }
+  const id = nanoid(8);
+  const hashed = await bcrypt.hash(password, SALT_ROUNDS);
+  const user = {
+    id,
+    name,
+    email: email || null,
+    ageGroup,
+    language,
+    motherTongue: motherTongue || null,
+    learning: Array.isArray(learning) ? learning : (learning ? [learning] : []),
+    passwordHash: hashed,
+    createdAt: new Date().toISOString(),
+    consentPending: false,
+    consentGiven: false,
+    parentEmail: null,
+    consentToken: null
+  };
+  if (isMinor(ageGroup)) {
+    if (!parentEmail) {
+      return res.status(400).json({ message: 'Parent/guardian email is required for minors.' });
+    }
+    user.parentEmail = parentEmail;
+    user.consentPending = true;
+    user.consentGiven = false;
+    user.consentToken = nanoid(24);
+  } else {
+    user.consentGiven = true;
+  }
+  users.push(user);
+  writeJSON(USERS_FILE, users);
+  if (user.consentGiven) {
+    const token = signToken({ id: user.id });
+    return res.json({ message: 'Signup successful', user: { id: user.id, name: user.name, ageGroup: user.ageGroup }, token });
+  }
+  res.json({
+    message: 'Signup created. Parental consent required.',
+    user: { id: user.id, name: user.name, ageGroup: user.ageGroup },
+    consent: { parentEmail: user.parentEmail, consentToken: user.consentToken }
+  });
+});
+
+// Parent verifies consent (prototype)
+app.get('/api/consent/verify', (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(400).json({ message: 'Token required' });
+  const users = readJSON(USERS_FILE) || [];
+  const user = users.find(u => u.consentToken === token);
+  if (!user) return res.status(404).json({ message: 'Consent token not found' });
+  user.consentGiven = true;
+  user.consentPending = false;
+  user.consentToken = null;
+  writeJSON(USERS_FILE, users);
+  res.json({ message: 'Parental consent verified. User is now active.', userId: user.id });
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  const { email, name, password } = req.body;
+  if ((!email && !name) || !password) return res.status(400).json({ message: 'Provide email or name and password.' });
+  const users = readJSON(USERS_FILE) || [];
+  const user = email ? users.find(u => u.email === email) : users.find(u => u.name === name);
+  if (!user) return res.status(400).json({ message: 'User not found' });
+  const ok = await bcrypt.compare(password, user.passwordHash || '');
+  if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
+  if (isMinor(user.ageGroup) && !user.consentGiven) {
+    return res.status(403).json({ message: 'Parental consent required', consentPending: true, parentEmail: user.parentEmail });
+  }
+  const token = signToken({ id: user.id });
+  res.json({ message: 'Login successful', token, user: { id: user.id, name: user.name, ageGroup: user.ageGroup } });
+});
+
+// Protected endpoints
+app.get('/api/me', authMiddleware, (req, res) => {
+  const u = { ...req.user };
+  delete u.passwordHash;
+  delete u.consentToken;
+  res.json({ user: u });
+});
+
+app.post('/api/activities/submit', authMiddleware, (req, res) => {
+  const { activityId } = req.body;
+  if (!activityId) return res.status(400).json({ message: 'activityId required' });
+  res.json({ message: 'Entry received', entryId: nanoid(10), userId: req.user.id });
+});
+
+app.get('/api/user/:id', authMiddleware, (req, res) => {
+  const users = readJSON(USERS_FILE) || [];
+  const user = users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ message: 'User not found' });
+  const u = { ...user }; delete u.passwordHash; delete u.consentToken;
+  res.json({ user: u });
+});
+
+app.listen(PORT, () => console.log(`ELEWA API running on http://localhost:${PORT}`));
